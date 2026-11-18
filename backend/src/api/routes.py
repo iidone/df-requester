@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.database import initialize_database
@@ -35,6 +35,7 @@ class CompletionInput(BaseModel):
 
 class UserInput(BaseModel):
     username: str = Field(min_length=1, max_length=80)
+    full_name: str = Field(min_length=1, max_length=120)
     role: Role
     password: str | None = Field(default=None, max_length=256)
 
@@ -64,14 +65,19 @@ async def require_role(user: CurrentUser, *roles: str) -> User:
 
 
 def user_payload(user: User) -> dict[str, object]:
-    return {"id": user.id, "username": user.username, "role": user.role}
+    return {
+        "id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role,
+    }
 
 
-def request_payload(request: Request) -> dict[str, object]:
+def request_payload(request: Request, requester: str | None = None) -> dict[str, object]:
     return {
         "id": request.id,
         "timestamp": request.created_at,
-        "requester": request.requester,
+        "requester": requester if requester is not None else request.requester,
         "item_type": request.item_type,
         "model": request.model,
         "is_custom": request.is_custom,
@@ -170,11 +176,21 @@ async def logout(
 
 @router.get("/requests")
 async def list_requests(session: SessionDep, user: CurrentUser) -> list[dict[str, object]]:
-    statement = select(Request).order_by(Request.created_at.desc(), Request.id.desc())
+    statement = (
+        select(Request, User)
+        .outerjoin(User, Request.created_by_id == User.id)
+        .order_by(Request.created_at.desc(), Request.id.desc())
+    )
     if user.role == "manager":
         statement = statement.where(Request.created_by_id == user.id)
-    requests = (await session.scalars(statement)).all()
-    return [request_payload(item) for item in requests]
+    rows = (await session.execute(statement)).all()
+    return [
+        request_payload(
+            item,
+            owner.full_name if owner and owner.full_name.strip() and item.requester == owner.username else None,
+        )
+        for item, owner in rows
+    ]
 
 
 @router.post("/requests", status_code=status.HTTP_201_CREATED)
@@ -198,13 +214,23 @@ async def create_request(
     await require_role(user, "manager", "admin")
     if is_custom and (image is None or not image.filename):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Для кастомного изделия необходимо изображение")
-    requester_name = (requester or user.username) if user.role == "admin" else user.username
+    requester_name = (
+        (requester or user.full_name or user.username)
+        if user.role == "admin"
+        else user.full_name or user.username
+    )
     if user.role == "manager":
         duplicate = await session.scalar(
             select(Request)
             .where(
                 Request.is_custom == is_custom,
-                func.lower(func.trim(Request.requester)) == requester_name.strip().lower(),
+                or_(
+                    func.lower(func.trim(Request.requester)) == requester_name.strip().lower(),
+                    and_(
+                        Request.created_by_id == user.id,
+                        func.lower(func.trim(Request.requester)) == user.username.strip().lower(),
+                    ),
+                ),
                 func.lower(func.trim(Request.item_type)) == item_type.strip().lower(),
                 func.lower(func.trim(Request.model)) == model.strip().lower(),
                 func.lower(func.trim(Request.size)) == size.strip().lower(),
@@ -347,7 +373,12 @@ async def create_user(data: UserInput, session: SessionDep, user: CurrentUser) -
         )
     if await session.scalar(select(User.id).where(User.username == data.username)):
         raise HTTPException(status.HTTP_409_CONFLICT, "Логин уже занят")
-    new_user = User(username=data.username, password_hash=hash_password(data.password), role=data.role)
+    new_user = User(
+        username=data.username,
+        full_name=data.full_name.strip(),
+        password_hash=hash_password(data.password),
+        role=data.role,
+    )
     session.add(new_user)
     await session.commit()
     await session.refresh(new_user)
@@ -371,11 +402,11 @@ async def update_user(
     if target.id == user.id and data.role != "admin":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Нельзя изменить собственную роль администратора")
     target.username = data.username
+    target.full_name = data.full_name.strip()
     target.role = data.role
     if data.password:
         target.password_hash = hash_password(data.password)
-        for auth_session in list(target.sessions):
-            await session.delete(auth_session)
+        await session.execute(delete(AuthSession).where(AuthSession.user_id == target.id))
     await session.commit()
     await session.refresh(target)
     return user_payload(target)
